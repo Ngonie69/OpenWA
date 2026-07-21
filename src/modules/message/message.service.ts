@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SessionService } from '../session/session.service';
 import { SendTextMessageDto, SendMediaMessageDto, MessageResponseDto } from './dto';
-import { MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
+import { MediaInput, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { HookManager } from '../../core/hooks';
 
@@ -21,6 +21,17 @@ export class MessageService {
     private readonly sessionService: SessionService,
     private readonly hookManager: HookManager,
   ) {}
+
+  /**
+   * An unconfirmed send is recorded as pending rather than sent: the message has very likely gone out,
+   * but without a message id nothing can confirm or track it. Marking it failed would be worse — callers
+   * that retry on failure would re-send a message the recipient already has.
+   */
+  private applySendResult(message: Message, result: MessageResult): void {
+    message.waMessageId = result.id;
+    message.status = result.unconfirmed ? MessageStatus.PENDING : MessageStatus.SENT;
+    message.timestamp = result.timestamp;
+  }
 
   async sendText(sessionId: string, dto: SendTextMessageDto): Promise<MessageResponseDto> {
     // Execute hook before sending - plugins can modify or block
@@ -50,9 +61,7 @@ export class MessageService {
       const result = await engine.sendTextMessage(finalDto.chatId, finalDto.text);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       // Execute hook after successful send
@@ -65,6 +74,7 @@ export class MessageService {
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       // Mark as failed
@@ -97,14 +107,13 @@ export class MessageService {
       const result = await engine.sendImageMessage(dto.chatId, media);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -128,14 +137,13 @@ export class MessageService {
       const result = await engine.sendVideoMessage(dto.chatId, media);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -158,14 +166,13 @@ export class MessageService {
       const result = await engine.sendAudioMessage(dto.chatId, media);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -189,14 +196,13 @@ export class MessageService {
       const result = await engine.sendDocumentMessage(dto.chatId, media);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -253,14 +259,13 @@ export class MessageService {
       });
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -289,14 +294,13 @@ export class MessageService {
       });
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -319,14 +323,13 @@ export class MessageService {
       const result = await engine.sendStickerMessage(dto.chatId, media);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -352,14 +355,13 @@ export class MessageService {
       const result = await engine.replyToMessage(dto.chatId, dto.quotedMessageId, dto.text);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
@@ -385,14 +387,13 @@ export class MessageService {
       const result = await engine.forwardMessage(dto.fromChatId, dto.toChatId, dto.messageId);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
+      this.applySendResult(message, result);
       await this.messageRepository.save(message);
 
       return {
         messageId: result.id,
         timestamp: result.timestamp,
+        ...(result.unconfirmed ? { unconfirmed: true } : {}),
       };
     } catch (error) {
       message.status = MessageStatus.FAILED;
