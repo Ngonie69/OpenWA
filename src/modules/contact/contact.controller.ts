@@ -1,5 +1,6 @@
 import { Controller, Get, Post, Delete, Param, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import { EngineNotReadyError } from '../../engine/errors/engine-not-ready.error';
 import { SessionService } from '../session/session.service';
 
 @ApiTags('contacts')
@@ -53,10 +54,11 @@ export class ContactController {
     status: 200,
     description: 'Number existence check result',
   })
+  @ApiResponse({ status: 503, description: 'Session not started, or its client not ready yet' })
   async checkNumber(@Param('sessionId') sessionId: string, @Param('number') number: string) {
     const engine = this.sessionService.getEngine(sessionId);
     if (!engine) {
-      throw new Error('Session is not started');
+      throw new EngineNotReadyError('Session is not started');
     }
     const exists = await engine.checkNumberExists(number);
     return {

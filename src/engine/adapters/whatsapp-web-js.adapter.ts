@@ -27,6 +27,7 @@ import {
   ProductQueryOptions,
   PaginatedProducts,
 } from '../interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../errors/engine-not-ready.error';
 import { createLogger } from '../../common/services/logger.service';
 import {
   GroupChat,
@@ -947,7 +948,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
-      throw new Error('WhatsApp client is not ready');
+      throw new EngineNotReadyError();
     }
   }
 }

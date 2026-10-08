@@ -403,6 +403,7 @@ flowchart TB
 NODE_ENV=production
 PORT=2785
 API_PREFIX=/api
+API_BODY_LIMIT=16mb   # largest JSON/form body; base64 documents need more than Express's 100kb
 LOG_LEVEL=info
 LOG_FORMAT=json
 

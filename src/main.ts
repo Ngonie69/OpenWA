@@ -1,8 +1,11 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { applyHttpPipeline, DEFAULT_REQUEST_BODY_LIMIT } from './common/http/http-pipeline';
 import { ShutdownService } from './common/services/shutdown.service';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
@@ -65,7 +68,9 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // No default body parsers: applyHttpPipeline registers them below with the configured limit, and
+  // Nest's own would refuse anything over Express's 100kb default first.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
 
   // Enable shutdown hooks for graceful shutdown
   app.enableShutdownHooks();
@@ -159,6 +164,12 @@ async function bootstrap() {
       next();
     },
   );
+
+  // Body parsers with API_BODY_LIMIT, after the middleware above, which is where Nest puts its
+  // defaults; and a 503 for a session whose client is not ready yet.
+  applyHttpPipeline(app, {
+    bodyLimit: app.get(ConfigService).get<string>('api.bodyLimit') ?? DEFAULT_REQUEST_BODY_LIMIT,
+  });
 
   // Enhanced Validation pipe with security options
   app.useGlobalPipes(
