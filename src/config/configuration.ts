@@ -1,3 +1,5 @@
+import { requestBodyLimit } from '../common/http/http-pipeline';
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
 
@@ -66,6 +68,8 @@ export default () => ({
 
   // API configuration
   api: {
+    // Largest request body (JSON or form) the API accepts, from API_BODY_LIMIT; 16mb when unset.
+    bodyLimit: requestBodyLimit(),
     rateLimit: {
       // Short burst protection: 10 requests per second
       shortTtl: parseInt(process.env.RATE_LIMIT_SHORT_TTL || '1000', 10),
