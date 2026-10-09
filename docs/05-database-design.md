@@ -256,6 +256,7 @@ CREATE TABLE sessions (
     push_name VARCHAR(100),
     config JSONB NOT NULL DEFAULT '{}',
     auth_state JSONB,
+    auto_start BOOLEAN,
     connected_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
@@ -270,6 +271,9 @@ CREATE INDEX idx_sessions_created_at ON sessions(created_at);
 > [!NOTE]
 > `auth_state` is optional and engine-specific. By default, `whatsapp-web.js` stores auth state on the filesystem, while Baileys can store an encrypted blob in the database when enabled. This column can store the blob or an encrypted pointer/path.
 
+> [!NOTE]
+> `auto_start` records whether the session should be running: `start()` sets it and `stop()` clears it. On startup every session with it set is started again, so a restart or reboot does not leave paired sessions disconnected. It is null only on rows from before the column existed; the first startup that sees one sets it from the row's last status.
+
 **Session Status Values:**
 
 ```mermaid
@@ -280,6 +284,8 @@ stateDiagram-v2
     qr_ready --> authenticating: QR scanned
     authenticating --> ready: Auth success
     authenticating --> failed: Auth failed
+    initializing --> disconnected: Not ready within readyTimeoutMs
+    authenticating --> disconnected: Not ready within readyTimeoutMs
     ready --> disconnected: Connection lost
     disconnected --> initializing: reconnect()
     ready --> [*]: DELETE
@@ -302,6 +308,7 @@ stateDiagram-v2
 {
   "autoReconnect": true,
   "maxReconnectAttempts": 5,
+  "readyTimeoutMs": 300000,
   "puppeteer": {
     "headless": true,
     "args": ["--no-sandbox"]

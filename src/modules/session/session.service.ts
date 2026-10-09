@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  OnApplicationBootstrap,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
@@ -24,8 +25,21 @@ interface ReconnectState {
   baseDelay: number;
 }
 
+/** How long a session may sit in initializing or authenticating before its engine is restarted. */
+const DEFAULT_READY_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Gap between restored sessions at startup, so their browsers do not all launch at once. */
+const RESTORE_STAGGER_MS = 3000;
+
+const ACTIVE_STATUSES = [
+  SessionStatus.READY,
+  SessionStatus.INITIALIZING,
+  SessionStatus.QR_READY,
+  SessionStatus.AUTHENTICATING,
+];
+
 @Injectable()
-export class SessionService implements OnModuleDestroy, OnModuleInit {
+export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicationBootstrap {
   private readonly logger = createLogger('SessionService');
 
   // In-memory map of active engine instances
@@ -33,6 +47,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
 
   // Reconnection state per session
   private reconnectStates: Map<string, ReconnectState> = new Map();
+
+  // Restarts an engine that never reaches ready or a QR code (whatsapp-web.js can hang after
+  // 'authenticated' and never emit 'ready', and nothing else moves the session out of that state)
+  private readyTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // Sessions to start again once the application has bootstrapped, found by onModuleInit
+  private sessionsToRestore: string[] = [];
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -46,19 +67,31 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
   ) {}
 
   /**
-   * On backend startup, reset all active session statuses to disconnected
-   * because the engines are not running yet after restart
+   * On backend startup, note which sessions should be running, then reset all active session
+   * statuses to disconnected because the engines are not running yet after restart
    */
   async onModuleInit(): Promise<void> {
-    const activeStatuses = [
-      SessionStatus.READY,
-      SessionStatus.INITIALIZING,
-      SessionStatus.QR_READY,
-      SessionStatus.AUTHENTICATING,
-    ];
+    const sessions = await this.sessionRepository.find();
+    this.sessionsToRestore = [];
+
+    for (const session of sessions) {
+      let autoStart = session.autoStart;
+
+      if (autoStart === null || autoStart === undefined) {
+        // A row from before autoStart existed: it was meant to be running if it still was when the
+        // process stopped. Stop-Process and a reboot kill the gateway without shutdown hooks, so the
+        // last status is what it was running as.
+        autoStart = ACTIVE_STATUSES.includes(session.status);
+        await this.sessionRepository.update(session.id, { autoStart });
+      }
+
+      if (autoStart) {
+        this.sessionsToRestore.push(session.id);
+      }
+    }
 
     const result = await this.sessionRepository.update(
-      { status: In(activeStatuses) },
+      { status: In(ACTIVE_STATUSES) },
       { status: SessionStatus.DISCONNECTED },
     );
 
@@ -70,7 +103,60 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     }
   }
 
+  /**
+   * Starts every session that was running before the restart. Not awaited: a browser launch can take
+   * minutes, and startup must not wait on it.
+   */
+  onApplicationBootstrap(): void {
+    void this.restoreSessions();
+  }
+
+  async restoreSessions(staggerMs = RESTORE_STAGGER_MS): Promise<void> {
+    const ids = this.sessionsToRestore;
+    this.sessionsToRestore = [];
+
+    for (const [index, id] of ids.entries()) {
+      if (index > 0 && staggerMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, staggerMs));
+      }
+
+      // Each start runs on its own, so one that hangs does not hold up the rest
+      void this.restoreSession(id);
+    }
+  }
+
+  private async restoreSession(id: string): Promise<void> {
+    if (this.engines.has(id)) return;
+
+    let session: Session;
+    try {
+      session = await this.findOne(id);
+    } catch {
+      return; // Deleted since startup
+    }
+
+    this.logger.log(`Restoring session after restart: ${session.name}`, {
+      sessionId: id,
+      action: 'restore',
+    });
+
+    try {
+      await this.start(id);
+    } catch (error: unknown) {
+      // start has already scheduled the retry
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Restoring session ${session.name} failed`, errorMessage, {
+        sessionId: id,
+        action: 'restore_error',
+      });
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
+    for (const id of [...this.readyTimers.keys()]) {
+      this.clearReadyWatchdog(id);
+    }
+
     // Clean up all engines on shutdown
     for (const [sessionId, engine] of this.engines) {
       this.logger.log(`Destroying engine for session ${sessionId}`, {
@@ -152,6 +238,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
 
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
+    this.clearReadyWatchdog(id);
 
     // Stop engine if running
     const engine = this.engines.get(id);
@@ -191,6 +278,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
       throw new BadRequestException('Session is already started');
     }
 
+    // A reconnect still waiting from an earlier engine would otherwise replace the one started here
+    this.cancelReconnect(id);
+
+    // Remembered so that a gateway restart starts it again
+    await this.sessionRepository.update(id, { autoStart: true });
+
     // Execute hook before starting
     await this.hookManager.execute(
       'session:starting',
@@ -213,7 +306,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
       baseDelay: config?.reconnectBaseDelay ?? 5000,
     });
 
-    await this.initializeEngine(id, session);
+    try {
+      await this.initializeEngine(id, session);
+    } catch (error) {
+      // Often transient (WhatsApp Web reloading itself mid-inject), so keep trying in the background;
+      // the caller still hears that this attempt failed
+      this.scheduleReconnect(id, session);
+      throw error;
+    }
     return this.findOne(id);
   }
 
@@ -231,8 +331,48 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     });
     this.engines.set(id, engine);
 
+    // An engine replaced or abandoned by the watchdog can still report in while it is torn down.
+    // Its news is about a browser that is going away, so it must not move the session's status.
+    const isCurrent = (): boolean => this.engines.get(id) === engine;
+
+    this.armReadyWatchdog(id, session, engine);
+
+    try {
+      await this.runEngine(id, session, engine, isCurrent);
+    } catch (error) {
+      // Left registered, a dead engine makes every later start answer "already started", and its
+      // browser keeps running
+      if (isCurrent()) {
+        this.clearReadyWatchdog(id);
+        this.engines.delete(id);
+        try {
+          await engine.destroy();
+        } catch (destroyError: unknown) {
+          this.logger.warn(`Destroying the failed engine for ${session.name} failed`, {
+            sessionId: id,
+            error: destroyError instanceof Error ? destroyError.message : String(destroyError),
+            action: 'engine_init_destroy_failed',
+          });
+        }
+      }
+      throw error;
+    }
+
+    if (isCurrent()) {
+      await this.updateStatus(id, SessionStatus.INITIALIZING);
+    }
+  }
+
+  private async runEngine(
+    id: string,
+    session: Session,
+    engine: IWhatsAppEngine,
+    isCurrent: () => boolean,
+  ): Promise<void> {
     await engine.initialize({
       onQRCode: (): void => {
+        if (!isCurrent()) return;
+
         this.logger.log('QR code generated', {
           sessionId: id,
           action: 'qr_generated',
@@ -251,6 +391,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
         void this.updateStatus(id, SessionStatus.QR_READY);
       },
       onReady: (phone: string, pushName: string): void => {
+        if (!isCurrent()) return;
+
+        this.clearReadyWatchdog(id);
         this.logger.log(`Session ready: ${phone}`, {
           sessionId: id,
           phone,
@@ -313,6 +456,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
           });
       },
       onDisconnected: (reason: string): void => {
+        if (!isCurrent()) return;
+
+        this.clearReadyWatchdog(id);
         this.logger.warn(`Session disconnected: ${reason}`, {
           sessionId: id,
           reason,
@@ -335,6 +481,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
         this.scheduleReconnect(id, session);
       },
       onStateChanged: (engineState: EngineStatus): void => {
+        if (!isCurrent()) return;
+
+        if (engineState === EngineStatus.INITIALIZING || engineState === EngineStatus.AUTHENTICATING) {
+          // Each step on the way to ready gets the full timeout
+          this.armReadyWatchdog(id, session, engine);
+        } else {
+          this.clearReadyWatchdog(id);
+        }
+
         const statusMap: Record<EngineStatus, SessionStatus> = {
           [EngineStatus.DISCONNECTED]: SessionStatus.DISCONNECTED,
           [EngineStatus.INITIALIZING]: SessionStatus.INITIALIZING,
@@ -349,13 +504,78 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
         }
       },
     });
-
-    await this.updateStatus(id, SessionStatus.INITIALIZING);
   }
 
-  private scheduleReconnect(id: string, session: Session): void {
+  private armReadyWatchdog(id: string, session: Session, engine: IWhatsAppEngine): void {
+    this.clearReadyWatchdog(id);
+
+    const configured = (session.config as { readyTimeoutMs?: number } | null)?.readyTimeoutMs;
+    const timeoutMs = typeof configured === 'number' ? configured : DEFAULT_READY_TIMEOUT_MS;
+    if (timeoutMs <= 0) return;
+
+    const timer = setTimeout(() => {
+      void this.restartStuckEngine(id, session, engine, timeoutMs);
+    }, timeoutMs);
+    timer.unref?.();
+    this.readyTimers.set(id, timer);
+  }
+
+  private clearReadyWatchdog(id: string): void {
+    const timer = this.readyTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.readyTimers.delete(id);
+    }
+  }
+
+  /**
+   * The engine has sat in initializing or authenticating for the whole timeout. Tear it down and go
+   * through the reconnect backoff; once that is spent, mark the session failed so it reads as broken
+   * rather than as forever on its way up.
+   */
+  private async restartStuckEngine(
+    id: string,
+    session: Session,
+    engine: IWhatsAppEngine,
+    timeoutMs: number,
+  ): Promise<void> {
+    this.readyTimers.delete(id);
+    if (this.engines.get(id) !== engine) return;
+
+    const engineStatus = engine.getStatus();
+    if (engineStatus !== EngineStatus.INITIALIZING && engineStatus !== EngineStatus.AUTHENTICATING) return;
+
+    this.logger.warn(
+      `Session ${session.name} was still ${engineStatus} after ${Math.round(timeoutMs / 1000)}s; restarting it`,
+      { sessionId: id, status: engineStatus, action: 'ready_timeout' },
+    );
+
+    // Removed before the teardown, so the events it fires on the way out are ignored
+    this.engines.delete(id);
+    try {
+      await engine.destroy();
+    } catch (error: unknown) {
+      this.logger.warn(`Destroying the stuck engine for ${session.name} failed`, {
+        sessionId: id,
+        error: error instanceof Error ? error.message : String(error),
+        action: 'ready_timeout_destroy_failed',
+      });
+    }
+
+    if (this.scheduleReconnect(id, session)) {
+      await this.updateStatus(id, SessionStatus.DISCONNECTED);
+    } else {
+      await this.updateStatus(id, SessionStatus.FAILED);
+    }
+  }
+
+  /** Returns false when no reconnect will happen: none is set up for the session, or all are used. */
+  private scheduleReconnect(id: string, session: Session): boolean {
     const state = this.reconnectStates.get(id);
-    if (!state) return;
+    if (!state) return false;
+
+    // One attempt pending at a time: the watchdog and a failed initialize can both ask for one
+    if (state.timer) return true;
 
     if (state.attempts >= state.maxAttempts) {
       this.logger.error(`Max reconnect attempts reached for session: ${session.name}`, undefined, {
@@ -363,7 +583,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
         attempts: state.attempts,
         action: 'reconnect_failed',
       });
-      return;
+      return false;
     }
 
     // Exponential backoff: baseDelay * 2^attempts (with jitter)
@@ -381,11 +601,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     );
 
     state.timer = setTimeout(() => {
+      state.timer = null;
       void this.executeReconnect(id, session, state);
     }, delay);
+    return true;
   }
 
   private async executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void> {
+    // Stopped, deleted or started afresh since this attempt was scheduled
+    if (this.reconnectStates.get(id) !== state) return;
+
     try {
       // Clean up old engine
       const oldEngine = this.engines.get(id);
@@ -421,6 +646,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
 
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
+    this.clearReadyWatchdog(id);
+
+    // Stopped on purpose, so a gateway restart leaves it stopped
+    await this.sessionRepository.update(id, { autoStart: false });
 
     const engine = this.engines.get(id);
 
