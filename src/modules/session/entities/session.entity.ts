@@ -43,6 +43,14 @@ export class Session {
   @Column({ type: 'varchar', length: 10, nullable: true })
   proxyType: 'http' | 'https' | 'socks4' | 'socks5' | null;
 
+  /**
+   * Whether the session should be running: set by start, cleared by stop. A restart of the gateway
+   * starts every session that has it set. Null only on rows from before the column existed, which
+   * are resolved from their last status on the first startup that sees them.
+   */
+  @Column({ type: 'boolean', nullable: true, default: null })
+  autoStart: boolean | null;
+
   @Column({ type: dateColumnType(), nullable: true, transformer: DateTransformer })
   connectedAt: Date | null;
 
