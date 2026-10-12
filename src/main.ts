@@ -6,6 +6,8 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { applyHttpPipeline, DEFAULT_REQUEST_BODY_LIMIT } from './common/http/http-pipeline';
+import { keepAliveOnUnhandledRejection } from './common/process/unhandled-rejection';
+import { createLogger } from './common/services/logger.service';
 import { ShutdownService } from './common/services/shutdown.service';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
@@ -210,4 +212,12 @@ async function bootstrap() {
   console.log(`📚 Swagger docs: http://localhost:${port}/api/docs`);
 }
 
-void bootstrap();
+// One rejected promise that nobody was waiting on would otherwise end the gateway, and every session
+// with it. See keepAliveOnUnhandledRejection for where they come from.
+keepAliveOnUnhandledRejection();
+
+// A start that fails still has to end the process: it used to do so as an unhandled rejection.
+bootstrap().catch((error: unknown) => {
+  createLogger('Bootstrap').error('OpenWA failed to start', error instanceof Error ? error.stack : String(error));
+  process.exit(1);
+});
