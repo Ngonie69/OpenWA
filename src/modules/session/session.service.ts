@@ -13,6 +13,7 @@ import { Session, SessionStatus } from './entities/session.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
 import { IWhatsAppEngine, EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineStartCancelledError } from '../../engine/errors/engine-start-cancelled.error';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -309,6 +310,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     try {
       await this.initializeEngine(id, session);
     } catch (error) {
+      if (error instanceof EngineStartCancelledError) {
+        // A stop, a delete or the ready watchdog overtook this start and decides what happens next,
+        // so no retry is scheduled here. The caller hears why its start did not finish.
+        throw new ConflictException(
+          `Session '${session.name}' was stopped, deleted or restarted before it finished starting`,
+        );
+      }
+
       // Often transient (WhatsApp Web reloading itself mid-inject), so keep trying in the background;
       // the caller still hears that this attempt failed
       this.scheduleReconnect(id, session);
@@ -341,8 +350,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.runEngine(id, session, engine, isCurrent);
     } catch (error) {
       // Left registered, a dead engine makes every later start answer "already started", and its
-      // browser keeps running
-      if (isCurrent()) {
+      // browser keeps running. A cancelled start is already being torn down by whoever cancelled it,
+      // and the engine stays registered until that is done so that no start launches against a
+      // profile its browser still holds.
+      if (isCurrent() && !(error instanceof EngineStartCancelledError)) {
         this.clearReadyWatchdog(id);
         this.engines.delete(id);
         try {
@@ -622,6 +633,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // Re-initialize
       await this.initializeEngine(id, session);
     } catch (error: unknown) {
+      // Overtaken by a stop, a delete or the ready watchdog, which decide what happens next
+      if (error instanceof EngineStartCancelledError) return;
+
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Reconnect attempt ${state.attempts} failed`, errorMessage, {
         sessionId: id,
