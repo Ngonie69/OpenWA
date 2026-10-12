@@ -29,6 +29,7 @@ import {
   PaginatedProducts,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotReadyError } from '../errors/engine-not-ready.error';
+import { EngineStartCancelledError } from '../errors/engine-start-cancelled.error';
 import { createLogger } from '../../common/services/logger.service';
 import {
   GroupChat,
@@ -43,6 +44,23 @@ const DEFAULT_BROWSER_CLOSE_TIMEOUT_MS = 15_000;
 
 /** Once the process is ended, how long to wait for the close that was waiting on it. */
 const BROWSER_END_SETTLE_MS = 5_000;
+
+/**
+ * How long a close waits for a browser that is still launching to reach the client. Puppeteer gives a
+ * launch 30 seconds before it fails it, so by then there is a browser to close or there never will be.
+ */
+const DEFAULT_BROWSER_LAUNCH_WAIT_MS = 35_000;
+
+/** How often a close looks for the browser it is waiting on. */
+const BROWSER_LAUNCH_POLL_MS = 50;
+
+/** A start that has not finished: the client being started, and how to end the wait on it. */
+interface PendingStart {
+  client: Client;
+  /** Resolves, either way, once whatsapp-web.js has finished starting or has given up. */
+  ended: Promise<void>;
+  cancel: (error: EngineStartCancelledError) => void;
+}
 
 /** True when the promise settles, either way, inside the time allowed. */
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -87,6 +105,8 @@ export interface WhatsAppWebJsConfig {
   sessionDataPath: string;
   /** How long the browser may take to close before its process is ended. Defaults to 15 seconds. */
   browserCloseTimeoutMs?: number;
+  /** How long a close waits for a browser that is still launching. Defaults to 35 seconds. */
+  browserLaunchWaitMs?: number;
   puppeteer?: {
     headless?: boolean;
     args?: string[];
@@ -110,6 +130,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private callbacks: EngineEventCallbacks = {};
+  private pendingStart: PendingStart | null = null;
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -151,7 +172,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         this.logger.log(`Launching browser from ${executablePath}`);
       }
 
-      this.client = new Client({
+      const client = new Client({
         authStrategy: new LocalAuth({
           clientId: this.config.sessionId,
           dataPath: path.resolve(this.config.sessionDataPath),
@@ -163,11 +184,79 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         },
       });
 
+      this.client = client;
       this.setupEventHandlers();
-      await this.client.initialize();
+      await this.startClient(client);
     } catch (error) {
-      this.setStatus(EngineStatus.FAILED);
+      // A start that disconnect or destroy overtook has not failed, and they report the status
+      if (!(error instanceof EngineStartCancelledError)) {
+        this.setStatus(EngineStatus.FAILED);
+      }
       throw error;
+    }
+  }
+
+  /**
+   * Starts the client, and lets disconnect and destroy end the wait on it.
+   *
+   * whatsapp-web.js cannot be told to stop starting. Left to itself the start only ends when the
+   * browser is closed under it, and while Chrome is still launching there is no browser to close: a
+   * stop that arrived then returned at once, and the start ran on to the end in a browser nothing
+   * held any more.
+   */
+  private async startClient(client: Client): Promise<void> {
+    const starting = client.initialize();
+
+    let cancel!: (error: EngineStartCancelledError) => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancel = reject;
+    });
+
+    const pending: PendingStart = {
+      client,
+      ended: starting.then(
+        () => undefined,
+        () => undefined,
+      ),
+      cancel,
+    };
+    this.pendingStart = pending;
+
+    try {
+      // After a cancel the start still ends, when the browser closes under it. The race keeps that
+      // rejection handled although nobody is waiting for it any more.
+      await Promise.race([starting, cancelled]);
+    } finally {
+      if (this.pendingStart === pending) {
+        this.pendingStart = null;
+      }
+    }
+  }
+
+  /**
+   * Waits for a browser that is still launching to reach the client, so that it can be closed.
+   *
+   * whatsapp-web.js holds the browser only once Chrome is up, and its destroy closes nothing before
+   * then. Returning at that point left Chrome running with the profile locked, and every later start
+   * of the session failed with "The browser is already running".
+   */
+  private async browserHandedOver(pending: PendingStart): Promise<void> {
+    let ended = false;
+    void pending.ended.then(() => {
+      ended = true;
+    });
+
+    const waitMs = this.config.browserLaunchWaitMs ?? DEFAULT_BROWSER_LAUNCH_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    // A start that ends with no browser never launched one, so there is nothing to wait for
+    while (!pending.client.pupBrowser && !ended && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, BROWSER_LAUNCH_POLL_MS));
+    }
+
+    if (!pending.client.pupBrowser && !ended) {
+      this.logger.warn(
+        `Browser for ${this.config.sessionId} was still launching after ${waitMs}ms; it cannot be closed from here`,
+      );
     }
   }
 
@@ -283,8 +372,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * still reading as ready. A browser left running also keeps the profile locked, so the next start
    * cannot launch against it. The profile is kept either way: this is how the browser already ends
    * whenever the gateway itself is killed.
+   *
+   * A start still waiting on this client ends first, with EngineStartCancelledError.
    */
   private async closeClient(client: Client): Promise<void> {
+    const pending = this.pendingStart?.client === client ? this.pendingStart : null;
+    if (pending) {
+      this.pendingStart = null;
+      pending.cancel(new EngineStartCancelledError());
+      await this.browserHandedOver(pending);
+    }
+
     const browserPid = client.pupBrowser?.process()?.pid;
     const timeoutMs = this.config.browserCloseTimeoutMs ?? DEFAULT_BROWSER_CLOSE_TIMEOUT_MS;
 

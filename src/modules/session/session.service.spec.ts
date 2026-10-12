@@ -9,6 +9,7 @@ import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
 import { EngineStatus, EngineEventCallbacks } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineStartCancelledError } from '../../engine/errors/engine-start-cancelled.error';
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -588,6 +589,337 @@ describe('SessionService', () => {
       await jest.advanceTimersByTimeAsync(READY_TIMEOUT_MS * 2);
       expect(engines[0].destroy).not.toHaveBeenCalled();
       expect(engineFactory.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── a start overtaken before it finishes ──────────────────────────
+
+  describe('a start that is still pending', () => {
+    const READY_TIMEOUT_MS = 5 * 60 * 1000;
+    let engines: Record<string, jest.Mock>[];
+    let browserClosed: Promise<void>;
+
+    // An engine whose start never finishes by itself. As the adapter does, closing it ends the start
+    // at once with EngineStartCancelledError, and the close returns when the browser is gone.
+    function pendingEngine(): Record<string, jest.Mock> {
+      let cancel: (error: Error) => void = () => {};
+      const close = (): Promise<void> => {
+        cancel(new EngineStartCancelledError());
+        return browserClosed;
+      };
+      return {
+        ...mockEngine,
+        initialize: jest.fn().mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              cancel = reject;
+            }),
+        ),
+        disconnect: jest.fn().mockImplementation(close),
+        destroy: jest.fn().mockImplementation(close),
+      };
+    }
+
+    /** Starts the session and returns once its engine is waiting on the browser. */
+    async function startAndWait(): Promise<{ outcome: Promise<unknown> }> {
+      const outcome = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(engines[engines.length - 1].initialize).toHaveBeenCalled();
+      return { outcome };
+    }
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      engines = [];
+      browserClosed = Promise.resolve();
+      (engineFactory.create as jest.Mock).mockImplementation(() => {
+        const engine = pendingEngine();
+        engines.push(engine);
+        return engine;
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('is ended by a stop, and answers with a conflict', async () => {
+      const { outcome } = await startAndWait();
+
+      await service.stop('sess-uuid-1');
+
+      const error = await outcome;
+      expect(error).toBeInstanceOf(ConflictException);
+      expect((error as Error).message).toContain('before it finished starting');
+
+      // Torn down once, by the stop
+      expect(engines[0].disconnect).toHaveBeenCalledTimes(1);
+      expect(engines[0].destroy).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(repository.update).toHaveBeenLastCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
+
+      // Stopped on purpose, so nothing brings it back
+      await jest.advanceTimersByTimeAsync(READY_TIMEOUT_MS * 2);
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('answers before the browser has closed, and holds off the next start until it has', async () => {
+      let releaseBrowser: () => void = () => {};
+      browserClosed = new Promise<void>(resolve => {
+        releaseBrowser = resolve;
+      });
+      const { outcome } = await startAndWait();
+
+      const stopping = service.stop('sess-uuid-1');
+
+      expect(await outcome).toBeInstanceOf(ConflictException);
+      // The profile is still held, so a start now would launch against a running browser
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(BadRequestException);
+
+      releaseBrowser();
+      await stopping;
+
+      await startAndWait();
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+    });
+
+    it('is ended by a delete', async () => {
+      const { outcome } = await startAndWait();
+
+      await service.delete('sess-uuid-1');
+
+      expect(await outcome).toBeInstanceOf(ConflictException);
+      expect(engines[0].destroy).toHaveBeenCalledTimes(1);
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+
+      await jest.advanceTimersByTimeAsync(READY_TIMEOUT_MS * 2);
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('is ended by the ready watchdog, which then restarts the session', async () => {
+      const { outcome } = await startAndWait();
+
+      await jest.advanceTimersByTimeAsync(READY_TIMEOUT_MS);
+
+      expect(await outcome).toBeInstanceOf(ConflictException);
+      expect(engines[0].destroy).toHaveBeenCalledTimes(1);
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(repository.update).toHaveBeenLastCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
+
+      await jest.advanceTimersByTimeAsync(6000);
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+    });
+
+    it('is dropped when a stop overtakes a reconnect attempt', async () => {
+      (engineFactory.create as jest.Mock).mockImplementationOnce(() => ({
+        ...mockEngine,
+        initialize: jest.fn().mockRejectedValue(new Error('Execution context was destroyed')),
+      }));
+      await expect(service.start('sess-uuid-1')).rejects.toThrow('Execution context was destroyed');
+
+      // The retry is now waiting on its browser
+      await jest.advanceTimersByTimeAsync(6000);
+      expect(engines).toHaveLength(1);
+      expect(engines[0].initialize).toHaveBeenCalled();
+
+      await service.stop('sess-uuid-1');
+
+      expect(engines[0].disconnect).toHaveBeenCalledTimes(1);
+      expect(engines[0].destroy).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+
+      await jest.advanceTimersByTimeAsync(READY_TIMEOUT_MS * 2);
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── a start overtaken before it has an engine ─────────────────────
+
+  describe('a start that has not created its engine yet', () => {
+    let releaseHook: () => void;
+    let autoStartWrites: boolean[];
+
+    /** Holds session:starting open, as a plugin doing slow I/O in it would. */
+    function holdStartingHook(): void {
+      const held = new Promise<void>(resolve => {
+        releaseHook = resolve;
+      });
+      (hookManager.execute as jest.Mock).mockImplementation(async (event: string) => {
+        if (event === 'session:starting') await held;
+        return { continue: true, data: {} };
+      });
+    }
+
+    /** Starts the session and returns once the start is waiting inside the hook. */
+    async function startAndWaitInHook(): Promise<{ outcome: Promise<unknown> }> {
+      const outcome = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(hookManager.execute).toHaveBeenCalledWith('session:starting', expect.anything(), expect.anything());
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      return { outcome };
+    }
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      autoStartWrites = [];
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockImplementation((_id: string, change: Partial<Session>) => {
+        if (typeof change.autoStart === 'boolean') autoStartWrites.push(change.autoStart);
+        return Promise.resolve({ affected: 1 });
+      });
+      holdStartingHook();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('is withdrawn by a stop, and never creates an engine', async () => {
+      const { outcome } = await startAndWaitInHook();
+
+      await service.stop('sess-uuid-1');
+      releaseHook();
+
+      const error = await outcome;
+      expect(error).toBeInstanceOf(ConflictException);
+      expect((error as Error).message).toContain('before it finished starting');
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
+
+      // Stopped on purpose, so nothing brings it back
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+
+      // ...and the next press of Start works
+      await service.start('sess-uuid-1');
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+    });
+
+    it('leaves autoStart off when the stop wrote it before the start did', async () => {
+      // The write the start makes is held back, so the one the stop makes lands first
+      let releaseStartWrite: () => void = () => {};
+      const startWriteHeld = new Promise<void>(resolve => {
+        releaseStartWrite = resolve;
+      });
+      (repository.update as jest.Mock).mockImplementation(async (_id: string, change: Partial<Session>) => {
+        if (change.autoStart === true) await startWriteHeld;
+        if (typeof change.autoStart === 'boolean') autoStartWrites.push(change.autoStart);
+        return { affected: 1 };
+      });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      const outcome = service.start('sess-uuid-1').catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(0);
+      await service.stop('sess-uuid-1');
+      expect(autoStartWrites).toEqual([false]);
+
+      releaseStartWrite();
+
+      expect(await outcome).toBeInstanceOf(ConflictException);
+      expect(autoStartWrites[autoStartWrites.length - 1]).toBe(false);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('is withdrawn by a delete, and never creates an engine', async () => {
+      const { outcome } = await startAndWaitInHook();
+
+      await service.delete('sess-uuid-1');
+      releaseHook();
+
+      expect(await outcome).toBeInstanceOf(ConflictException);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+
+    it('turns a second start away, so one engine is created and not two', async () => {
+      const { outcome } = await startAndWaitInHook();
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(BadRequestException);
+
+      releaseHook();
+      const started = await outcome;
+      expect(started).not.toBeInstanceOf(Error);
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+      expect(autoStartWrites).toEqual([true]);
+    });
+
+    it('lets a start through again after one that found no session', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValueOnce(null);
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(NotFoundException);
+
+      releaseHook();
+      await service.start('sess-uuid-1');
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+    });
+  });
+
+  // ── a reconnect overtaken while the old browser closes ────────────
+
+  describe('a reconnect that is still closing the old browser', () => {
+    let callbacks: EngineEventCallbacks[];
+    let oldBrowserClosed: () => void;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      callbacks = [];
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockImplementation((cb: EngineEventCallbacks) => {
+        callbacks.push(cb);
+        return Promise.resolve();
+      });
+      mockEngine.destroy.mockImplementation(
+        () =>
+          new Promise<void>(resolve => {
+            oldBrowserClosed = resolve;
+          }),
+      );
+      // A separate engine per start, as the factory makes them, so the old one can be told from a new one
+      (engineFactory.create as jest.Mock).mockImplementation(() => ({ ...mockEngine }));
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    /** The session drops, and its reconnect gets as far as closing the browser of the old engine. */
+    async function reconnectUntilOldBrowserCloses(): Promise<void> {
+      await service.start('sess-uuid-1');
+      callbacks[0].onDisconnected?.('NAVIGATION');
+      await jest.advanceTimersByTimeAsync(6000);
+      expect(mockEngine.destroy).toHaveBeenCalledTimes(1);
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+    }
+
+    it('does not start a new engine after a stop', async () => {
+      await reconnectUntilOldBrowserCloses();
+
+      await service.stop('sess-uuid-1');
+      oldBrowserClosed();
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000);
+
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+    });
+
+    it('leaves alone the engine of a start made after a stop', async () => {
+      await reconnectUntilOldBrowserCloses();
+
+      await service.stop('sess-uuid-1');
+      await service.start('sess-uuid-1');
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+
+      oldBrowserClosed();
+      await jest.advanceTimersByTimeAsync(60 * 1000);
+
+      // Still the engine that start made, and no third one from the old reconnect
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+      expect(service.isActive('sess-uuid-1')).toBe(true);
     });
   });
 });

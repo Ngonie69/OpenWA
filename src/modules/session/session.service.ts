@@ -13,6 +13,7 @@ import { Session, SessionStatus } from './entities/session.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
 import { IWhatsAppEngine, EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineStartCancelledError } from '../../engine/errors/engine-start-cancelled.error';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -51,6 +52,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   // Restarts an engine that never reaches ready or a QR code (whatsapp-web.js can hang after
   // 'authenticated' and never emit 'ready', and nothing else moves the session out of that state)
   private readyTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // Starts that have not created their engine yet: they are still reading the session, writing
+  // autoStart and running the session:starting hook. A stop or a delete that arrives then finds no
+  // engine to close, so it withdraws the start here instead.
+  private preparingStarts: Map<string, { withdrawn: boolean }> = new Map();
 
   // Sessions to start again once the application has bootstrapped, found by onModuleInit
   private sessionsToRestore: string[] = [];
@@ -239,6 +245,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
     this.clearReadyWatchdog(id);
+    this.withdrawPreparingStart(id);
 
     // Stop engine if running
     const engine = this.engines.get(id);
@@ -272,27 +279,53 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   async start(id: string): Promise<Session> {
-    const session = await this.findOne(id);
-
-    if (this.engines.has(id)) {
+    // Two starts side by side would each create an engine, and the second browser would launch
+    // against the profile the first one holds
+    if (this.preparingStarts.has(id)) {
       throw new BadRequestException('Session is already started');
     }
 
-    // A reconnect still waiting from an earlier engine would otherwise replace the one started here
-    this.cancelReconnect(id);
+    // Registered before the first wait, so a stop or a delete that arrives at any point from here
+    // until the engine exists has this start to withdraw
+    const preparing = { withdrawn: false };
+    this.preparingStarts.set(id, preparing);
 
-    // Remembered so that a gateway restart starts it again
-    await this.sessionRepository.update(id, { autoStart: true });
+    let session: Session;
+    try {
+      session = await this.findOne(id);
 
-    // Execute hook before starting
-    await this.hookManager.execute(
-      'session:starting',
-      { sessionId: id },
-      {
-        sessionId: id,
-        source: 'SessionService',
-      },
-    );
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
+
+      // A reconnect still waiting from an earlier engine would otherwise replace the one started here
+      this.cancelReconnect(id);
+
+      // Remembered so that a gateway restart starts it again
+      await this.sessionRepository.update(id, { autoStart: true });
+
+      // Execute hook before starting
+      await this.hookManager.execute(
+        'session:starting',
+        { sessionId: id },
+        {
+          sessionId: id,
+          source: 'SessionService',
+        },
+      );
+
+      if (preparing.withdrawn) {
+        // The stop's own write may have landed before the one above, which would bring the session
+        // back at the next gateway restart
+        await this.sessionRepository.update(id, { autoStart: false });
+        throw this.startOvertaken(session);
+      }
+    } finally {
+      this.preparingStarts.delete(id);
+    }
+
+    // Nothing waits between here and initializeEngine registering the engine, so from now on a stop
+    // or a delete finds an engine to close
 
     // Initialize reconnect state
     const config = session.config as {
@@ -309,12 +342,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     try {
       await this.initializeEngine(id, session);
     } catch (error) {
+      if (error instanceof EngineStartCancelledError) {
+        // A stop, a delete or the ready watchdog overtook this start and decides what happens next,
+        // so no retry is scheduled here. The caller hears why its start did not finish.
+        throw this.startOvertaken(session);
+      }
+
       // Often transient (WhatsApp Web reloading itself mid-inject), so keep trying in the background;
       // the caller still hears that this attempt failed
       this.scheduleReconnect(id, session);
       throw error;
     }
     return this.findOne(id);
+  }
+
+  private startOvertaken(session: Session): ConflictException {
+    return new ConflictException(
+      `Session '${session.name}' was stopped, deleted or restarted before it finished starting`,
+    );
+  }
+
+  /** A start that has not created its engine yet has nothing to close: it is told not to go on. */
+  private withdrawPreparingStart(id: string): void {
+    const preparing = this.preparingStarts.get(id);
+    if (preparing) {
+      preparing.withdrawn = true;
+    }
   }
 
   private async initializeEngine(id: string, session: Session): Promise<void> {
@@ -341,8 +394,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.runEngine(id, session, engine, isCurrent);
     } catch (error) {
       // Left registered, a dead engine makes every later start answer "already started", and its
-      // browser keeps running
-      if (isCurrent()) {
+      // browser keeps running. A cancelled start is already being torn down by whoever cancelled it,
+      // and the engine stays registered until that is done so that no start launches against a
+      // profile its browser still holds.
+      if (isCurrent() && !(error instanceof EngineStartCancelledError)) {
         this.clearReadyWatchdog(id);
         this.engines.delete(id);
         try {
@@ -616,12 +671,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const oldEngine = this.engines.get(id);
       if (oldEngine) {
         await oldEngine.destroy();
-        this.engines.delete(id);
+        // Only if it is still the old one: a start made while its browser closed has its own engine
+        if (this.engines.get(id) === oldEngine) {
+          this.engines.delete(id);
+        }
+        // Stopped, deleted or started afresh while the old browser closed
+        if (this.reconnectStates.get(id) !== state) return;
       }
 
       // Re-initialize
       await this.initializeEngine(id, session);
     } catch (error: unknown) {
+      // Overtaken by a stop, a delete or the ready watchdog, which decide what happens next
+      if (error instanceof EngineStartCancelledError) return;
+
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Reconnect attempt ${state.attempts} failed`, errorMessage, {
         sessionId: id,
@@ -647,6 +710,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
     this.clearReadyWatchdog(id);
+    this.withdrawPreparingStart(id);
 
     // Stopped on purpose, so a gateway restart leaves it stopped
     await this.sessionRepository.update(id, { autoStart: false });

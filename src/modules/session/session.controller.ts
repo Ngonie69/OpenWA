@@ -104,6 +104,10 @@ export class SessionController {
   })
   @ApiResponse({ status: 400, description: 'Session already started' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 409,
+    description: 'Session was stopped, deleted or restarted before it finished starting',
+  })
   async start(@Param('id') id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.start(id);
     await this.auditService.logInfo(AuditAction.SESSION_STARTED, {
