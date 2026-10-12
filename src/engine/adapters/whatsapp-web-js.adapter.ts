@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { execFileSync } from 'child_process';
 import { Client, LocalAuth, Message, MessageMedia } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
@@ -37,9 +38,55 @@ import {
   GroupCreateResult,
 } from '../types/whatsapp-web-js.types';
 
+/** How long a browser may take to close when asked before its process is ended instead. */
+const DEFAULT_BROWSER_CLOSE_TIMEOUT_MS = 15_000;
+
+/** Once the process is ended, how long to wait for the close that was waiting on it. */
+const BROWSER_END_SETTLE_MS = 5_000;
+
+/** True when the promise settles, either way, inside the time allowed. */
+function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    const settled = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    promise.then(settled, settled);
+  });
+}
+
+/** Ends a browser and the processes it started. Chrome runs as a tree, and the children hold the profile too. */
+function endProcessTree(pid: number): void {
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', timeout: 5000 });
+      return;
+    } catch {
+      // Already gone, or taskkill refused: fall through to ending the one process
+    }
+  } else {
+    try {
+      // Puppeteer launches the browser as the leader of its own process group
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch {
+      // Not a group leader, or already gone
+    }
+  }
+
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Already gone
+  }
+}
+
 export interface WhatsAppWebJsConfig {
   sessionId: string;
   sessionDataPath: string;
+  /** How long the browser may take to close before its process is ended. Defaults to 15 seconds. */
+  browserCloseTimeoutMs?: number;
   puppeteer?: {
     headless?: boolean;
     args?: string[];
@@ -228,12 +275,48 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.emit('stateChanged', status);
   }
 
+  /**
+   * Closes the client's browser, and ends the browser's process if the close has not finished in time.
+   *
+   * Puppeteer asks Chrome to exit and then waits for the process with no limit of its own. A Chrome
+   * that was slow to shut down held the stop request open until the caller gave up, with the session
+   * still reading as ready. A browser left running also keeps the profile locked, so the next start
+   * cannot launch against it. The profile is kept either way: this is how the browser already ends
+   * whenever the gateway itself is killed.
+   */
+  private async closeClient(client: Client): Promise<void> {
+    const browserPid = client.pupBrowser?.process()?.pid;
+    const timeoutMs = this.config.browserCloseTimeoutMs ?? DEFAULT_BROWSER_CLOSE_TIMEOUT_MS;
+
+    const closing = client.destroy();
+    if (await settlesWithin(closing, timeoutMs)) {
+      await closing;
+      return;
+    }
+
+    if (browserPid === undefined) {
+      this.logger.warn(
+        `Browser for ${this.config.sessionId} had not closed after ${timeoutMs}ms and has no process to end`,
+      );
+      return;
+    }
+
+    this.logger.warn(
+      `Browser for ${this.config.sessionId} had not closed after ${timeoutMs}ms; ending process ${browserPid}`,
+    );
+    endProcessTree(browserPid);
+
+    // The close was waiting on that process. Its outcome no longer matters, only that it is over
+    // before a start is allowed to launch against the same profile.
+    await settlesWithin(closing, BROWSER_END_SETTLE_MS);
+  }
+
   async disconnect(): Promise<void> {
     if (this.client) {
       try {
         // Use destroy instead of logout to preserve session data
         // This allows reconnecting without needing to scan QR again
-        await this.client.destroy();
+        await this.closeClient(this.client);
       } catch (error) {
         this.logger.warn('Destroy client failed:', String(error));
         // Already destroyed or not initialized - ignore
@@ -252,7 +335,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         this.logger.warn('Logout failed:', String(error));
         // Fall back to destroy if logout fails
         try {
-          await this.client.destroy();
+          await this.closeClient(this.client);
         } catch (destroyError) {
           this.logger.warn('Client destroy also failed during logout fallback', String(destroyError));
         }
@@ -264,7 +347,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async destroy(): Promise<void> {
     if (this.client) {
-      await this.client.destroy();
+      await this.closeClient(this.client);
       this.client = null;
       this.setStatus(EngineStatus.DISCONNECTED);
     }
