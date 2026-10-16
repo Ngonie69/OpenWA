@@ -1,0 +1,2 @@
+# patch-package parses these line by line; a CRLF checkout would not apply.
+patches/*.patch text eol=lf

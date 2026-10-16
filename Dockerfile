@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
 
 # Copy package files
 COPY package*.json ./
+# npm ci's postinstall applies these to node_modules (see patches/README.md)
+COPY patches ./patches
 
 # Install all dependencies (including devDependencies for build)
 RUN npm ci
@@ -62,6 +64,8 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+# npm ci's postinstall applies these to node_modules (see patches/README.md)
+COPY patches ./patches
 
 # Install production dependencies only
 RUN npm ci --omit=dev && npm cache clean --force

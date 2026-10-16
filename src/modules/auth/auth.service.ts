@@ -9,6 +9,23 @@ import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
 
 const API_KEY_FILE = join(process.cwd(), 'data', '.api-key');
+const DEV_ADMIN_KEY = 'dev-admin-key';
+const NO_KEY_FILE = '(check dashboard for keys)';
+
+/**
+ * What the startup banner shows for the admin key. Logs are kept and copied around, so a real key is
+ * shown only by the prefix the dashboard also lists (`keyPrefix`, 12 characters), and the banner says
+ * where to read it in full. The development key is public, so it is shown whole.
+ */
+export function bannerKey(displayKey: string): string {
+  if (displayKey === DEV_ADMIN_KEY || displayKey === NO_KEY_FILE) {
+    return displayKey;
+  }
+
+  // A hand-written key may be short: never show more than a third of it.
+  const prefix = displayKey.substring(0, Math.min(12, Math.floor(displayKey.length / 3)));
+  return `${prefix}… (full key in ${API_KEY_FILE})`;
+}
 
 @Injectable()
 export class AuthService implements OnModuleInit {
@@ -27,8 +44,7 @@ export class AuthService implements OnModuleInit {
 
     if (count === 0) {
       // Use predictable key in development, random key in production
-      displayKey =
-        process.env.NODE_ENV === 'production' ? `owa_k1_${randomBytes(32).toString('hex')}` : 'dev-admin-key';
+      displayKey = process.env.NODE_ENV === 'production' ? `owa_k1_${randomBytes(32).toString('hex')}` : DEV_ADMIN_KEY;
 
       await this.seedApiKey(displayKey, 'Default Admin Key', ApiKeyRole.ADMIN);
       isNewKey = true;
@@ -46,10 +62,10 @@ export class AuthService implements OnModuleInit {
           displayKey = readFileSync(API_KEY_FILE, 'utf-8').trim();
         } catch (error) {
           this.logger.warn(`Failed to read API key file: ${API_KEY_FILE}`, { error: String(error) });
-          displayKey = '(check dashboard for keys)';
+          displayKey = NO_KEY_FILE;
         }
       } else {
-        displayKey = '(check dashboard for keys)';
+        displayKey = NO_KEY_FILE;
       }
     }
 
@@ -70,7 +86,7 @@ export class AuthService implements OnModuleInit {
     } else {
       this.logger.log('  🔑 API Key:');
     }
-    this.logger.log(`     ${displayKey}`);
+    this.logger.log(`     ${bannerKey(displayKey)}`);
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     this.logger.log('');
